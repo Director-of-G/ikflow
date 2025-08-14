@@ -6,6 +6,7 @@ from jrl.config import DEVICE
 import wandb
 import numpy as np
 import torch
+torch.autograd.set_detect_anomaly(True)
 from pytorch_lightning.core.module import LightningModule
 
 
@@ -158,10 +159,47 @@ class IkfLitModel(LightningModule):
         neg_log_likeli = 0.5 * zz - jac
         loss = torch.mean(neg_log_likeli)
 
+        # add FK penalty
+        if self.base_hparams.fk_penalty_enabled:
+            _DEFAULT_LATENT_DISTRIBUTION = "gaussian"
+            _DEFAULT_LATENT_SCALE = 0.75
+            _DEFAULT_TORCH_DTYPE = torch.float32
+            _W_pos = 1.0
+            _W_rot = 0.1
+
+            # Sample q from the flow conditioned on x
+            t0 = time()
+            n = y.shape[0]
+            device = y.device
+            latent = draw_latent(_DEFAULT_LATENT_DISTRIBUTION, _DEFAULT_LATENT_SCALE, (n, self.base_hparams.dim_latent_space), device)
+            conditional_tiled = torch.cat([y, torch.zeros((n, 1), dtype=_DEFAULT_TORCH_DTYPE, device=device)], dim=1)
+            q_sample, _ = self.nn_model(latent, conditional_tiled, t0, True, False)
+
+            # FK on model output
+            poses_pred = self.ik_solver.robot.forward_kinematics(q_sample[:, :self.ndof])
+            pos_pred, quat_pred = poses_pred[..., :3], poses_pred[..., 3:]
+            pos_tgt, quat_tgt   = y[..., :3], y[..., 3:7]
+
+            pos_err_loss = torch.norm(pos_pred - pos_tgt, dim=1)  # L2 norm for position error
+
+            # Position error
+            quat_pred = quat_pred / torch.norm(quat_pred, dim=1, keepdim=True)  # Normalize quaternions
+            quat_tgt = quat_tgt / torch.norm(quat_tgt, dim=1, keepdim=True)  # Normalize quaternions
+
+            # Orientation error (using rotation matrix difference)
+            rot_diff = torch.sum(quat_pred * quat_tgt, dim=-1)
+            angle_err_loss = torch.acos(torch.clamp(rot_diff, -1.0, 1.0))  # Clamp to avoid NaNs
+
+            fk_loss = (_W_pos * pos_err_loss**2 + _W_rot * angle_err_loss**2).mean()
+
+            loss += self.base_hparams.lambda_fk * fk_loss
+
         loss_is_nan = torch.isnan(loss)
         if loss_is_nan:
             print("loss is Nan\n output:")
             print(output)
+            print("NaN detected: z", output.min().item(), output.max().item(),
+                "log_det", jac.min().item(), jac.max().item())
 
         loss_data = {
             "tr/output_max": torch.max(output).item(),
@@ -170,6 +208,7 @@ class IkfLitModel(LightningModule):
             "tr/output_std": torch.std(output).item(),
             "tr/loss_is_nan": int(loss_is_nan),
             "tr/loss_ml": loss.item(),
+            "tr/fk_penalty": fk_loss.item() if self.base_hparams.fk_penalty_enabled else 0.0
         }
         force_log = loss_is_nan
         return loss, loss_data, force_log

@@ -22,6 +22,7 @@ _tests/models/
 # Pytl training data
 checkpoints/
 training_logs/
+lightning_logs/
 old/
 notes_to_self
 notes

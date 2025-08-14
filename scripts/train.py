@@ -30,6 +30,8 @@ DEFAULT_COUPLING_LAYER = "glow"
 DEFAULT_RNVP_CLAMP = 2.5
 DEFAULT_SOFTFLOW_NOISE_SCALE = 0.001
 DEFAULT_SOFTFLOW_ENABLED = True
+DEFAULT_FK_PENALTY_ENABLED = False
+DEFAULT_LAMBDA_FK = 0.01
 DEFAULT_N_NODES = 6
 DEFAULT_DIM_LATENT_SPACE = 8
 DEFAULT_COEFF_FN_INTERNAL_SIZE = 1024
@@ -122,6 +124,8 @@ if __name__ == "__main__":
     parser.add_argument("--softflow_noise_scale", type=float, default=DEFAULT_SOFTFLOW_NOISE_SCALE)
     # NOTE: NEVER use 'bool' type with argparse. It will cause you pain and suffering.
     parser.add_argument("--softflow_enabled", type=str, default=DEFAULT_SOFTFLOW_ENABLED)
+    parser.add_argument("--fk_penalty_enabled", type=str, default=DEFAULT_FK_PENALTY_ENABLED)
+    parser.add_argument("--lambda_fk", type=float, default=DEFAULT_LAMBDA_FK)
     parser.add_argument("--nb_nodes", type=int, default=DEFAULT_N_NODES)
     parser.add_argument("--dim_latent_space", type=int, default=DEFAULT_DIM_LATENT_SPACE)
     parser.add_argument("--coeff_fn_config", type=int, default=DEFAULT_COEFF_FN_CONFIG)
@@ -181,6 +185,8 @@ if __name__ == "__main__":
     base_hparams.y_noise_scale = args.y_noise_scale
     base_hparams.zeros_noise_scale = args.zeros_noise_scale
     base_hparams.softflow_enabled = boolean_string(args.softflow_enabled)
+    base_hparams.fk_penalty_enabled = boolean_string(args.fk_penalty_enabled)
+    base_hparams.lambda_fk = args.lambda_fk
     base_hparams.sigmoid_on_output = boolean_string(args.sigmoid_on_output)
     print()
     print(base_hparams)

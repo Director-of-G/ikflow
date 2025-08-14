@@ -34,6 +34,9 @@ class IkflowModelParameters:
         self.softflow_noise_scale = 0.01
         self.softflow_enabled = True
 
+        self.fk_penalty_enabled = True
+        self.lambda_fk = 0.01
+
     def __str__(self) -> str:
         s = "IkflowModelParameters\n"
         for k, v in self.__dict__.items():
