@@ -9,7 +9,9 @@ from jrl.robots import Robot
 import torch
 
 from ikflow.config import DEVICE, DEFAULT_TORCH_DTYPE
-from ikflow.model import IkflowModelParameters, glow_cNF_model
+from ikflow.model import IkflowModelParameters, CVAEModelParameters, DiffusionModelParameters, glow_cNF_model
+from ikflow.cvae import cvae_model
+from ikflow.diffusion_transformer import transformer_diffusion_model
 from ikflow.evaluation_utils import evaluate_solutions, SOLUTION_EVALUATION_RESULT_TYPE
 
 
@@ -32,30 +34,39 @@ def draw_latent(
 class IKFlowSolver:
     def __init__(self, hyper_parameters: IkflowModelParameters, robot: Robot, compile_model: Optional[Dict] = None):
         """Initialize an IKFlowSolver."""
-        assert isinstance(
-            hyper_parameters, IkflowModelParameters
-        ), f"hyper_parameters should be a IkflowModelParameters type, is {type(hyper_parameters)}"
         assert isinstance(robot, Robot), f"robot should be a Robot type, is {type(robot)}"
         assert isinstance(compile_model, (type(None), Dict))
 
-        # Add 'sigmoid_on_output' if IkflowModelParameters instance doesn't have it. This will be the case when loading
-        # from training runs from before this parameter was added
-        if not hasattr(hyper_parameters, "sigmoid_on_output"):
-            hyper_parameters.sigmoid_on_output = False
-
-        if hyper_parameters.softflow_enabled:
-            assert not hyper_parameters.sigmoid_on_output, (
-                "sigmoid_on_output and softflow are incompatible, disable one or the other"
-            )
         self._robot = robot
         self.dim_cond = 7
-        if hyper_parameters.softflow_enabled:
-            self.dim_cond = 8  # [x, ... q3, softflow_scale]   (softflow_scale should be 0 for inference)
-        self._network_width = hyper_parameters.dim_latent_space
 
         self._do_compile_model = compile_model is not None
         self._model_weights_loaded = False
-        self.nn_model = glow_cNF_model(hyper_parameters, self._robot, self.dim_cond, self._network_width)
+
+        if isinstance(hyper_parameters, IkflowModelParameters):
+            # Add 'sigmoid_on_output' if IkflowModelParameters instance doesn't have it. This will be the case when loading
+            # from training runs from before this parameter was added
+            if not hasattr(hyper_parameters, "sigmoid_on_output"):
+                hyper_parameters.sigmoid_on_output = False
+
+            if hyper_parameters.softflow_enabled:
+                assert not hyper_parameters.sigmoid_on_output, (
+                    "sigmoid_on_output and softflow are incompatible, disable one or the other"
+                )
+
+            if hyper_parameters.softflow_enabled:
+                self.dim_cond = 8  # [x, ... q3, softflow_scale]   (softflow_scale should be 0 for inference)
+            
+            self._network_width = hyper_parameters.dim_latent_space
+            nn_model = glow_cNF_model(hyper_parameters, self._robot, self.dim_cond, self._network_width)
+        elif isinstance(hyper_parameters, CVAEModelParameters):
+            self._network_width = hyper_parameters.q_dim
+            nn_model = cvae_model(hyper_parameters, self._robot.actuated_joints_limits)
+        elif isinstance(hyper_parameters, DiffusionModelParameters):
+            self._network_width = hyper_parameters.q_dim
+            nn_model = transformer_diffusion_model(hyper_parameters)
+        self.nn_model = nn_model
+        
         if self._do_compile_model:
             warnings.warn(
                 "Compiling the ikflow model is not recommended. There are very minor inference speed reduction gains"
@@ -338,6 +349,7 @@ class IKFlowSolver:
                 conditional = torch.cat([y, torch.zeros((n, 1), dtype=DEFAULT_TORCH_DTYPE, device=device)], dim=1)
 
             # Get latent
+            breakpoint()
             if latent is None:
                 latent = draw_latent(latent_distribution, latent_scale, (n, self._network_width), device)
             return self._run_inference(latent, conditional, t0, clamp_to_joint_limits, return_detailed)

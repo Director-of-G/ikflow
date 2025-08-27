@@ -1,4 +1,5 @@
 from typing import Tuple, Dict
+from enum import Enum
 from time import time
 
 from jrl.robots import Fetch
@@ -6,15 +7,19 @@ from jrl.config import DEVICE
 import wandb
 import numpy as np
 import torch
+from torch import nn
 torch.autograd.set_detect_anomaly(True)
 from pytorch_lightning.core.module import LightningModule
+import torch.nn.functional as F
 
+from diffusers.schedulers.scheduling_ddim import DDIMScheduler
+from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 
 from ikflow.training.training_utils import get_softflow_noise
 from ikflow.config import SIGMOID_SCALING_ABS_MAX
 from ikflow.ikflow_solver import IKFlowSolver, draw_latent
-from ikflow.model import IkflowModelParameters
-from ikflow.utils import grad_stats
+from ikflow.model import IkflowModelParameters, CVAEModelParameters, DiffusionModelParameters
+from ikflow.utils import grad_stats, jacobian_trace
 from ikflow.evaluation_utils import evaluate_solutions
 from ikflow.thirdparty.ranger import RangerVA  # from ranger913A.py
 
@@ -27,11 +32,17 @@ _IK_SOLUTION_TABLE_COLUMNS = ["global_step", "target_pose", "solution", "realize
 ik_solution_table = wandb.Table(data=[], columns=_IK_SOLUTION_TABLE_COLUMNS)
 
 
+class ModelType(Enum):
+    Flow = 1
+    CVAE = 2
+    Diffusion = 3
+
+
 class IkfLitModel(LightningModule):
     def __init__(
         self,
         ik_solver: IKFlowSolver,
-        base_hparams: IkflowModelParameters,
+        base_hparams: IkflowModelParameters | CVAEModelParameters | DiffusionModelParameters,
         learning_rate: float,
         checkpoint_every: int,
         gamma: float = 0.975,
@@ -53,7 +64,47 @@ class IkfLitModel(LightningModule):
         self.nn_model.to(DEVICE)
         self.base_hparams = base_hparams
         self.ndof = self.ik_solver.robot.ndof
-        self.dim_tot = self.base_hparams.dim_latent_space
+
+        if isinstance(self.base_hparams, IkflowModelParameters):
+            self.dim_tot = self.base_hparams.dim_latent_space
+            self.loss_fn = self.ml_loss_fn
+            self.model_type = ModelType.Flow
+        elif isinstance(self.base_hparams, CVAEModelParameters):
+            self.loss_fn = self.cvae_loss_fn
+            self.model_type = ModelType.CVAE
+        elif isinstance(self.base_hparams, DiffusionModelParameters):
+            self.loss_fn = self.diffusion_loss_fn
+            self.model_type = ModelType.Diffusion
+
+            scheduler_cfg = {
+                "num_train_timesteps": self.base_hparams.num_train_timesteps,
+                # "num_sample_time_steps": self.base_hparams.num_sample_time_steps,
+                "beta_start": self.base_hparams.beta_start,
+                "beta_end": self.base_hparams.beta_end,
+            }
+
+            # noise scheduler
+            if self.base_hparams.scheduler_type == "DDPMScheduler":
+                self.scheduler = DDPMScheduler(**scheduler_cfg)
+            elif self.base_hparams.scheduler_type == "DDIMScheduler":
+                self.scheduler = DDIMScheduler(**scheduler_cfg)
+            else:
+                raise ValueError(f"Unknown scheduler type: {self.base_hparams.scheduler_type}")
+
+            # loss
+            if self.base_hparams.loss_type == "l1":
+                self.diff_loss = nn.SmoothL1Loss(reduction="mean")
+            elif self.base_hparams.loss_type == "l2":
+                self.diff_loss = nn.MSELoss(reduction="mean")
+            else:
+                raise ValueError(f"Unknown loss type: {self.base_hparams.loss_type}")
+
+            # other params
+            self.num_train_timesteps = self.base_hparams.num_train_timesteps
+            self.num_sample_timesteps = self.base_hparams.num_sample_time_steps
+        else:
+            raise ValueError(f"Unknown model type: {type(self.base_hparams)}")
+
         self.checkpoint_every = checkpoint_every
         self.log_every = log_every
 
@@ -108,7 +159,8 @@ class IkfLitModel(LightningModule):
                 about in training is our generalization error. Epoch is an unneccessary construct.
         """
         lr_scheduler = torch.optim.lr_scheduler.StepLR(
-            optimizer, step_size=self.hparams.step_lr_every, gamma=self.hparams.gamma, verbose=False
+            # optimizer, step_size=self.hparams.step_lr_every, gamma=self.hparams.gamma, verbose=False
+            optimizer, step_size=self.hparams.step_lr_every, gamma=self.hparams.gamma
         )
 
         # See 'configure_optimizers' in these docs to see the format of this dict: https://pytorch-lightning.readthedocs.io/en/stable/common/lightning_module.html
@@ -129,6 +181,8 @@ class IkfLitModel(LightningModule):
 
     def ml_loss_fn(self, batch):
         """Maximum likelihood loss"""
+        self.nn_model.train()
+
         x, y = batch
         y = y.to(DEVICE)
         x = x.to(DEVICE)
@@ -173,7 +227,16 @@ class IkfLitModel(LightningModule):
             device = y.device
             latent = draw_latent(_DEFAULT_LATENT_DISTRIBUTION, _DEFAULT_LATENT_SCALE, (n, self.base_hparams.dim_latent_space), device)
             conditional_tiled = torch.cat([y, torch.zeros((n, 1), dtype=_DEFAULT_TORCH_DTYPE, device=device)], dim=1)
-            q_sample, _ = self.nn_model(latent, conditional_tiled, t0, True, False)
+            
+            # q_sample, _ = self.nn_model(latent, conditional_tiled, t0, True, False)
+            breakpoint()
+            q_sample = self.ik_solver._run_inference(
+                latent=latent,
+                conditional=conditional_tiled,
+                t0=t0,
+                clamp_to_joint_limits=True,
+                return_detailed=False
+            )   # This runs in training mode instead of inference mode
 
             # FK on model output
             poses_pred = self.ik_solver.robot.forward_kinematics(q_sample[:, :self.ndof])
@@ -196,6 +259,13 @@ class IkfLitModel(LightningModule):
 
         loss_is_nan = torch.isnan(loss)
         if loss_is_nan:
+            breakpoint()
+            for node in self.nn_model.node_list:
+                if node.module is None:
+                    continue
+                for param in node.module.state_dict().keys():
+                    if torch.isnan(node.module.state_dict()[param]).any():
+                        print(f"NaN detected in {node.name}:{param}")
             print("loss is Nan\n output:")
             print(output)
             print("NaN detected: z", output.min().item(), output.max().item(),
@@ -212,6 +282,69 @@ class IkfLitModel(LightningModule):
         }
         force_log = loss_is_nan
         return loss, loss_data, force_log
+    
+    def cvae_loss_fn(self, batch):
+        """ Loss function for the  CVAE model """
+        self.nn_model.train()
+
+        x, y = batch
+        y = y.to(DEVICE)    # pose: x
+        x = x.to(DEVICE)    # q: joints
+
+        q_hat, mu, logvar = self.nn_model.forward(x, y)
+
+        recon = F.mse_loss(q_hat, x)
+        kl = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).mean()
+
+        loss = recon + self.base_hparams.beta_kl * kl
+        loss_is_nan = torch.isnan(loss)
+        loss_data = {
+            "tr/output_max": torch.max(q_hat).item(),
+            "tr/output_abs_ave": torch.mean(torch.abs(q_hat)).item(),
+            "tr/output_ave": torch.mean(q_hat).item(),
+            "tr/output_std": torch.std(q_hat).item(),
+            "tr/loss_is_nan": int(loss_is_nan),
+            "tr/loss_total": loss.item(),
+            "tr/loss_recon": recon.item(),
+            "tr/loss_kl": kl.item(),
+        }
+        force_log = loss_is_nan
+        return loss, loss_data, force_log
+    
+    def diffusion_loss_fn(self, batch):
+        """ Loss function for the Diffusion model """
+        self.nn_model.train()
+
+        x, y = batch
+        y = y.to(DEVICE)    # pose: x
+        x = x.to(DEVICE)    # q: joints
+
+        t = torch.randint(
+            0, self.num_train_timesteps, (x.shape[0],), device=x.device, dtype=torch.long
+        )
+        noise = torch.randn_like(x)
+        noised_x = self.scheduler.add_noise(x, noise, t)
+        pred = self.nn_model(q_t=noised_x, t=(t / self.num_train_timesteps).unsqueeze(1), x=y)
+        if self.base_hparams.prediction_type == "epsilon":
+            target = noise
+        elif self.base_hparams.prediction_type == "sample":
+            target = x
+        elif self.base_hparams.prediction_type == "v_prediction":
+            target = self.scheduler.get_velocity(x, noise, t)
+        else:
+            raise NotImplementedError()
+
+        diffusion_loss = self.diff_loss(pred, target)
+
+        loss = diffusion_loss
+        loss_is_nan = torch.isnan(loss)
+        loss_data = {
+            "tr/loss_is_nan": int(loss_is_nan),
+            "tr/loss_total": loss.item(),
+            "tr/loss_diffusion": diffusion_loss.item(),
+        }
+        force_log = loss_is_nan
+        return loss, loss_data, force_log
 
     def get_lr(self) -> float:
         """Returns the current learning rate"""
@@ -225,7 +358,7 @@ class IkfLitModel(LightningModule):
     def training_step(self, batch, batch_idx):
         del batch_idx
         t0 = time()
-        loss, loss_data, force_log = self.ml_loss_fn(batch)
+        loss, loss_data, force_log = self.loss_fn(batch)
 
         if (self.global_step % self.log_every == 0 and self.global_step > 0) or force_log:
             time_per_batch = time() - t0
@@ -380,19 +513,90 @@ class IkfLitModel(LightningModule):
         """
         assert len(y) == 7
 
-        # Note: No code change required here to handle using/not using softflow.
-        conditional = torch.zeros(m, self.ik_solver.dim_cond)
-        conditional[:, 0:3] = y[:3]
-        conditional[:, 3 : 3 + 4] = y[3:]
-        conditional = conditional.to(DEVICE)
+        if self.model_type == ModelType.Flow:
+            # Note: No code change required here to handle using/not using softflow.
+            conditional = torch.zeros(m, self.ik_solver.dim_cond)
+            conditional[:, 0:3] = y[:3]
+            conditional[:, 3 : 3 + 4] = y[3:]
+            conditional = conditional.to(DEVICE)
 
-        shape = (m, self.dim_tot)
-        latent = draw_latent("gaussian", 1, shape, None)
-        assert latent.shape[0] == m
-        assert latent.shape[1] == self.dim_tot
+            shape = (m, self.dim_tot)
+            latent = draw_latent("gaussian", 1, shape, None)
+            assert latent.shape[0] == m
+            assert latent.shape[1] == self.dim_tot
 
-        t0 = time()
-        output_rev, _ = self.nn_model(latent, c=conditional, rev=True)
-        if return_runtime:
-            return output_rev[:, 0 : self.ndof], time() - t0
-        return output_rev[:, 0 : self.ndof]
+            t0 = time()
+            output_rev, _ = self.nn_model(latent, c=conditional, rev=True)
+            if return_runtime:
+                return output_rev[:, 0 : self.ndof], time() - t0
+            return output_rev[:, 0 : self.ndof]
+        
+        elif self.model_type == ModelType.CVAE:
+            conditional = torch.zeros(m, 7)
+            conditional[:, 0:3] = y[:3]
+            conditional[:, 3 : 3 + 4] = y[3:]
+            conditional = conditional.to(DEVICE)
+
+            t0 = time()
+            output = self.nn_model.sample(conditional)
+            if return_runtime:
+                return output, time() - t0
+            return output
+        
+        elif self.model_type == ModelType.Diffusion:
+            cond = y
+            if len(cond.shape) == 1:
+                cond = cond.unsqueeze(0).repeat(m, 1)
+            x = torch.randn(m, self.nn_model.channels, device=DEVICE)
+            log_prob = (-x.square() / 2 - np.log(2 * np.pi) / 2).sum(1)
+            self.scheduler.set_timesteps(self.num_sample_timesteps, device=DEVICE)
+
+            need_log_prob = self.base_hparams.log_prob_type is not None
+            last_t = self.num_train_timesteps
+
+            t0 = time()
+            with torch.set_grad_enabled(need_log_prob):
+                for t in self.scheduler.timesteps:
+                    dx = torch.zeros_like(x)
+                    dx.requires_grad_(need_log_prob)
+                    x += dx
+                    dt = torch.full(
+                        (x.shape[0], 1),
+                        (last_t - t.item()) / self.num_train_timesteps,
+                        device=x.device,
+                        dtype=torch.float,
+                    )
+                    last_t = t.item()
+                    t_pad = torch.full(
+                        (x.shape[0],), t.item(), device=x.device, dtype=torch.long
+                    )
+                    model_output = self.nn_model(q_t=x, t=(t_pad / self.num_train_timesteps).unsqueeze(1), x=cond)
+                    alpha_prod = self.scheduler.alphas_cumprod.to(x.device)[t_pad][:, None]
+                    betas = self.scheduler.betas.to(x.device)[t_pad][:, None]
+                    if self.base_hparams.prediction_type == "epsilon":
+                        noise = model_output
+                    elif self.base_hparams.prediction_type == "v_prediction":
+                        noise = (
+                            model_output * alpha_prod.sqrt() + x * (1 - alpha_prod).sqrt()
+                        )
+                    score = -1 / (1 - alpha_prod).sqrt() * noise
+                    beta = betas * self.num_train_timesteps
+                    if self.base_hparams.ode:
+                        dy = (-0.5 * beta * x - score * beta / 2) * dt
+                    else:
+                        dy = (
+                            -0.5 * beta * x - score * beta
+                        ) * dt + beta.sqrt() * torch.randn_like(x) * dt.sqrt()
+                    log_prob -= (
+                        jacobian_trace(self.base_hparams.log_prob_type, dx, -dy / dt) * dt[:, 0]
+                    )
+                    x = x - dy
+                    x = x.detach()
+                    log_prob = log_prob.detach()
+
+            if not need_log_prob:
+                log_prob *= 0
+
+            if return_runtime:
+                return x, time() - t0
+            return x

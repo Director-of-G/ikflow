@@ -14,6 +14,7 @@ dependencies = [
     "nbconvert>=7.16.6",
     "numpy==1.24.4",
     "pandas>=2.2.3",
+    "torch>=2.4.0",
     "pytorch-lightning>=2.5.1",
     "ruff>=0.11.2",
     "tabulate>=0.9.0",
@@ -22,6 +23,7 @@ dependencies = [
     "jrl @ git+https://github.com/jstmn/Jrl.git@2ba7c3995b36b32886a8aa021a00c73b2cd55b2c",
     "pyqt5>=5.15.11",
     "pytest>=8.3.5",
+    "diffusers"
 ]
 
 [tool.setuptools.packages]

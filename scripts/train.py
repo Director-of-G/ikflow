@@ -12,7 +12,7 @@ from ikflow.config import DATASET_TAG_NON_SELF_COLLIDING
 from jrl.config import GPU_IDX
 
 from ikflow import config
-from ikflow.model import IkflowModelParameters
+from ikflow.model import IkflowModelParameters, CVAEModelParameters, DiffusionModelParameters
 from ikflow.ikflow_solver import IKFlowSolver
 from ikflow.training.lt_model import IkfLitModel
 from ikflow.training.lt_data import IkfLitDataset
@@ -118,7 +118,9 @@ if __name__ == "__main__":
     parser.add_argument("--wandb_run_id_to_load_checkpoint", type=str, help="Example: '34c2gimi'")
     parser.add_argument("--robot_name", type=str)
 
-    # Model parameters
+    parser.add_argument("--model_type", type=str, default="flow", help="Options: 'flow', 'cvae', 'diffusion'")
+
+    # [NFlow] Model parameters
     parser.add_argument("--coupling_layer", type=str, default=DEFAULT_COUPLING_LAYER)
     parser.add_argument("--rnvp_clamp", type=float, default=DEFAULT_RNVP_CLAMP)
     parser.add_argument("--softflow_noise_scale", type=float, default=DEFAULT_SOFTFLOW_NOISE_SCALE)
@@ -134,6 +136,19 @@ if __name__ == "__main__":
     parser.add_argument("--zeros_noise_scale", type=float, default=DEFAULT_ZEROS_NOISE_SCALE)
     # See note above about pain and suffering.
     parser.add_argument("--sigmoid_on_output", type=str, default=DEFAULT_SIGMOID_ON_OUTPUT)
+
+    # [CVAE] Model parameters
+    parser.add_argument("--dim_hidden", type=int, default=512)
+    parser.add_argument("--num_enc_layers", type=int, default=3)
+    parser.add_argument("--num_dec_layers", type=int, default=3)
+    parser.add_argument("--beta_kl", type=float, default=1.0)
+
+    # [Diffusion] Model parameters
+    parser.add_argument("--ff_dim_hidden", type=int, default=1024)
+    parser.add_argument("--num_transformer_heads", type=int, default=8)
+    parser.add_argument("--num_transformer_layers", type=int, default=8)
+    parser.add_argument("--num_train_timesteps", type=int, default=100)
+    parser.add_argument("--num_sample_timesteps", type=float, default=5)
 
     # Training parameters
     parser.add_argument("--optimizer", type=str, default=DEFAULT_OPTIMIZER)
@@ -173,21 +188,41 @@ if __name__ == "__main__":
 
     # Load model
     robot = get_robot(args.robot_name)
-    base_hparams = IkflowModelParameters()
-    base_hparams.run_description = args.run_description
-    base_hparams.coupling_layer = args.coupling_layer
-    base_hparams.nb_nodes = args.nb_nodes
-    base_hparams.dim_latent_space = args.dim_latent_space
-    base_hparams.coeff_fn_config = args.coeff_fn_config
-    base_hparams.coeff_fn_internal_size = args.coeff_fn_internal_size
-    base_hparams.rnvp_clamp = args.rnvp_clamp
-    base_hparams.softflow_noise_scale = args.softflow_noise_scale
-    base_hparams.y_noise_scale = args.y_noise_scale
-    base_hparams.zeros_noise_scale = args.zeros_noise_scale
-    base_hparams.softflow_enabled = boolean_string(args.softflow_enabled)
-    base_hparams.fk_penalty_enabled = boolean_string(args.fk_penalty_enabled)
-    base_hparams.lambda_fk = args.lambda_fk
-    base_hparams.sigmoid_on_output = boolean_string(args.sigmoid_on_output)
+
+    if args.model_type == "flow":
+        base_hparams = IkflowModelParameters()
+        base_hparams.run_description = args.run_description
+        base_hparams.coupling_layer = args.coupling_layer
+        base_hparams.nb_nodes = args.nb_nodes
+        base_hparams.dim_latent_space = args.dim_latent_space
+        base_hparams.coeff_fn_config = args.coeff_fn_config
+        base_hparams.coeff_fn_internal_size = args.coeff_fn_internal_size
+        base_hparams.rnvp_clamp = args.rnvp_clamp
+        base_hparams.softflow_noise_scale = args.softflow_noise_scale
+        base_hparams.y_noise_scale = args.y_noise_scale
+        base_hparams.zeros_noise_scale = args.zeros_noise_scale
+        base_hparams.softflow_enabled = boolean_string(args.softflow_enabled)
+        base_hparams.fk_penalty_enabled = boolean_string(args.fk_penalty_enabled)
+        base_hparams.lambda_fk = args.lambda_fk
+        base_hparams.sigmoid_on_output = boolean_string(args.sigmoid_on_output)
+    elif args.model_type == "cvae":
+        base_hparams = CVAEModelParameters()
+        base_hparams.q_dim = robot.ndof
+        base_hparams.z_dim = args.dim_latent_space
+        base_hparams.hidden = args.dim_hidden
+        base_hparams.enc_layers = args.num_enc_layers
+        base_hparams.dec_layers = args.num_dec_layers
+        base_hparams.beta_kl = args.beta_kl
+    elif args.model_type == "diffusion":
+        base_hparams = DiffusionModelParameters()
+        base_hparams.q_dim = robot.ndof
+        base_hparams.hidden = args.dim_hidden
+        base_hparams.ff_hidden_dim = args.ff_dim_hidden
+        base_hparams.num_layers = args.num_transformer_layers
+        base_hparams.num_heads = args.num_transformer_heads
+        base_hparams.num_train_timesteps = args.num_train_timesteps
+        base_hparams.num_sample_timesteps = args.num_sample_timesteps
+
     print()
     print(base_hparams)
 

@@ -195,3 +195,38 @@ def grad_stats(params_trainable) -> Tuple[float, float, float]:
             abs_ave_grads.append(p.grad.abs().mean().item())
             max_grad = max(max_grad, p.grad.data.max().item())
     return np.average(ave_grads), np.average(abs_ave_grads), max_grad
+
+
+# ______________
+# Utils migrated from DexLearn/naive_diffusion.py
+
+
+def jacobian_matrix(f, z):
+    """Calculates the Jacobian df/dz.
+    Stolen from: https://github.com/rtqichen/ffjord/blob/master/lib/layers/odefunc.py#L13
+    """
+    jacobian = torch.zeros((*f.shape, z.shape[-1]), device=f.device)
+    for i in range(f.shape[-1]):
+        jacobian[..., i, :] = torch.autograd.grad(
+            f[..., i].sum(), z, retain_graph=(i != f.shape[-1] - 1), allow_unused=True
+        )[0]
+    return jacobian.contiguous()
+
+
+def approx_jacobian_trace(f, z):
+    e = torch.normal(mean=0, std=1, size=f.shape, device=f.device, dtype=f.dtype)
+    grad = torch.autograd.grad(f, z, grad_outputs=e)[0]
+    return torch.einsum("nka,nka->nk", e, grad)
+
+
+def jacobian_trace(log_prob_type, dx, dy):
+    if log_prob_type == "accurate_cont":
+        # time consuming
+        jacobian_mat = jacobian_matrix(dy, dx)
+        return jacobian_mat.diagonal(dim1=-1, dim2=-2).sum(dim=-1)
+    elif log_prob_type == "estimate":
+        # quick
+        return approx_jacobian_trace(dy, dx)
+    else:
+        return 0
+    

@@ -42,6 +42,54 @@ class IkflowModelParameters:
         for k, v in self.__dict__.items():
             s += f"  {k}: \t{v}\n"
         return s
+    
+class CVAEModelParameters:
+    def __init__(self):
+        self.q_dim = 7
+        self.x_dim = 7
+        self.z_dim = 32
+        self.hidden = 512
+        self.enc_layers = 3
+        self.dec_layers = 3
+        self.recon_loss = "l2"  # or "l1"
+        self.beta_kl = 1.0
+        self.use_joint_limits = True
+
+    def __str__(self) -> str:
+        s = "CVAEModelParameters\n"
+        for k, v in self.__dict__.items():
+            s += f"  {k}: \t{v}\n"
+        return s
+    
+
+class DiffusionModelParameters:
+    def __init__(self):
+        self.q_dim = 7
+        self.x_dim = 7
+
+        # transformer parameters
+        self.hidden = 512
+        self.ff_hidden_dim = 1024
+        self.num_heads = 8
+        self.num_layers = 8
+
+        # scheduler
+        self.num_train_timesteps = 100
+        self.num_sample_time_steps = 5
+        self.beta_start = 0.0001
+        self.beta_end = 0.04
+        self.loss_type = "l1"  # or "l2"
+        self.prediction_type = "epsilon"  # or "sample" or "v_prediction"
+        self.scheduler_type = "DDIMScheduler"   # "DDPMScheduler" or "DDIMScheduler"
+
+        self.log_prob_type = None
+        self.ode = 1
+
+    def __str__(self) -> str:
+        s = "DiffusionModelParameters\n"
+        for k, v in self.__dict__.items():
+            s += f"  {k}: \t{v}\n"
+        return s
 
 
 # Convenience variable for testing purposes
